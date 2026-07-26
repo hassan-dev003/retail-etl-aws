@@ -4,7 +4,8 @@
 #
 # Uploads a local CSV to the raw/ prefix in S3, which triggers the
 # retail-clean Lambda, then polls processed/ until a NEW cleaned
-# Parquet file appears and prints a summary.
+# Parquet file appears and prints a summary — including the row
+# counts the Lambda logged to CloudWatch.
 #
 # Usage:
 #
@@ -16,6 +17,7 @@
 #
 set -euo pipefail
 
+# --- Constants ---
 BUCKET="uci-clv-demo-bucket"
 RAW_PREFIX="raw"
 PROCESSED_KEY="processed/online_retail_clean.parquet"
@@ -25,7 +27,25 @@ POLL_INTERVAL=5
 DRY_RUN=false
 LOCAL_FILE=""
 
-# Parse arguments
+# --- Pull the latest row-count line the Lambda logged ---
+print_run_summary() {
+  echo "--- pipeline run summary (from CloudWatch) ---"
+  local since msg
+  since=$(( ($(date +%s) - 300) * 1000 ))   # last 5 minutes, in milliseconds
+  msg="$(aws logs filter-log-events \
+          --log-group-name "$LAMBDA_LOG_GROUP" \
+          --start-time "$since" \
+          --filter-pattern '"rows_in"' \
+          --query 'events[-1].message' \
+          --output text 2>/dev/null || true)"
+  if [[ -n "$msg" && "$msg" != "None" ]]; then
+    echo "    ${msg}"
+  else
+    echo "    (no row-count log found yet — the Lambda log may still be flushing)"
+  fi
+}
+
+# --- Parse arguments ----
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=true; shift ;;
@@ -51,15 +71,15 @@ DEST="s3://${BUCKET}/${RAW_PREFIX}/${FILENAME}"
 echo "==> Source:      $LOCAL_FILE"
 echo "==> Destination: $DEST"
 
-# Dry run: describe & exit
+# --- Dry run: describe and exit ---
 if $DRY_RUN; then
   echo "[dry-run] Would upload the file above to $DEST"
   echo "[dry-run] Would then poll for a new $PROCESSED_KEY (timeout ${POLL_TIMEOUT}s)"
   exit 0
 fi
 
-# Record the processed file's current timestamp (if it exists at all) so
-# we can tell a freshly-written file apart from the one already there.
+# Record the processed file's current timestamp (if any) so we can tell a
+# freshly-written file apart from the one already there.
 BEFORE="$(aws s3 ls "s3://${BUCKET}/${PROCESSED_KEY}" 2>/dev/null | awk '{print $1" "$2}' || true)"
 
 echo "==> Uploading to raw/ ..."
@@ -73,6 +93,7 @@ while (( ELAPSED < POLL_TIMEOUT )); do
     echo "==> Done. Cleaned file written at: $AFTER"
     echo "--- processed object ---"
     aws s3 ls "s3://${BUCKET}/${PROCESSED_KEY}" --human-readable
+    print_run_summary
     exit 0
   fi
   sleep "$POLL_INTERVAL"
