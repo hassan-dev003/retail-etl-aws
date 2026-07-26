@@ -1,0 +1,25 @@
+# Credentials & secrets
+.env
+.env.*
+*.pem
+*.key
+.aws/
+credentials
+*.csv.enc
+
+# Data: too large and unnecessary; download from source instead
+data/
+*.csv
+*.parquet
+*.xlsx
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
