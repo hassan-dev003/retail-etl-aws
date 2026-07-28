@@ -6,7 +6,7 @@ import awswrangler as wr
 import pandas as pd
 import pg8000.dbapi
 
-# ––– DB Config –––
+# ––– CONSTANTS –––
 DB = dict(
     host=os.environ["DB_HOST"],
     port=int(os.environ.get("DB_PORT", "5432")),
@@ -14,6 +14,9 @@ DB = dict(
     user=os.environ["DB_USER"],
     password=os.environ["DB_PASSWORD"],
 )
+
+BUCKET = os.environ["BUCKET"]
+PROCESSED_KEY = os.environ.get("PROCESSED_KEY", "processed/online_retail_clean.parquet")
 
 TABLE = "customer_aggregates"
 COLUMNS = "(customer_id, country, n_orders, n_items, total_spend, first_purchase, last_purchase)"
@@ -29,6 +32,18 @@ ON CONFLICT (customer_id) DO UPDATE SET
     loaded_at      = now()
 """
 BATCH_SIZE = 1000
+
+
+# ––– Parse S3 event to determine source parquet –––
+def resolve_source(event):
+    # S3 trigger carries object; a scheduled event does not,
+    # so we default to the latest processed file.
+    records = event.get("Records") if isinstance(event, dict) else None
+    if records:
+        s3 = records[0]["s3"]
+        return s3["bucket"]["name"], urllib.parse.unquote_plus(s3["object"]["key"])
+    return BUCKET, PROCESSED_KEY
+
 
 # ––– Supabase connection via Session Pooler –––
 # Relaxed verification for demo purposes
@@ -87,10 +102,8 @@ def upsert(conn, rows):
 
 # ––– Lambda handler (main function) –––
 def lambda_handler(event, context):
-    # 1. Resolve the parquet that triggered this run
-    record = event["Records"][0]["s3"]
-    bucket = record["bucket"]["name"]
-    key = urllib.parse.unquote_plus(record["object"]["key"])
+    # 1. Resolve the source (S3 upload or scheduled refresh)
+    bucket, key = resolve_source(event)
 
     # 2. Read and aggregate to one row per customer
     df = wr.s3.read_parquet(f"s3://{bucket}/{key}")
@@ -103,5 +116,5 @@ def lambda_handler(event, context):
     finally:
         conn.close()
 
-    print(f"rows_read={len(df)} customers_loaded={len(rows)}")
+    print(f"source=s3://{bucket}/{key} rows_read={len(df)} customers_loaded={len(rows)}")
     return {"rows_read": len(df), "customers_loaded": len(rows)}
