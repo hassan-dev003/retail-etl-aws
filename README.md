@@ -31,7 +31,7 @@ CustomerID, removes negative quantities and prices, and drops cancelled orders
 `processed/`. Runtime: Python 3.12 with the AWS-managed AWSSDKPandas layer
 (pandas + pyarrow). Every run logs row counts.
 
-Latest run: **541,909 in → 397,884 ou;→ 144,025 rejected.**
+Latest run: **541,909 in → 397,884 out; 144,025 rejected.**
 
 ### 3. Load — Postgres  *(in progress)*
 <!-- TODO: a second Lambda aggregates transactions to customer level and loads
