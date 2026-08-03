@@ -1,5 +1,6 @@
 import os
 import io
+import json
 import csv
 import ssl
 import datetime as dt
@@ -26,14 +27,22 @@ DIM_BATCH = 1000
 
 # ––– Parse S3 event to determine source parquet –––
 def resolve_source(event):
-    # S3 trigger carries object; a scheduled event does not,
-    # so we default to the latest processed file.
+    # Handles 3 shapes:
+    # 1. Direct S3 event
+    # 2. SQS message wrapping an event
+    # 3. Schedule event 
     records = event.get("Records") if isinstance(event, dict) else None
-    if records:
-        s3 = records[0]["s3"]
-        return s3["bucket"]["name"], urllib.parse.unquote_plus(s3["object"]["key"])
-    return BUCKET, PROCESSED_KEY
-
+    if not records:
+        return BUCKET, PROCESSED_KEY
+    record = records[0]
+    if "body" in record:        # SQS-wrapped S3 event
+        inner = json.loads(record["body"]).get("Records")
+        if not inner:           # e.g. an S3 test event
+            return BUCKET, PROCESSED_KEY
+        s3 = inner[0]["s3"]
+    else:                       # direct S3 event
+        s3 = record["s3"]
+    return s3["bucket"]["name"], urllib.parse.unquote_plus(s3["object"]["key"])
 
 # ––– Supabase connection via Session Pooler –––
 # Relaxed verification for demo purposes
