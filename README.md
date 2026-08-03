@@ -1,25 +1,22 @@
 # retail-etl-aws
 
 An event-driven ETL pipeline on AWS that ingests and cleans the UCI Online
-Retail dataset (541,909 rows) and loads customer-level aggregates into Postgres.
-Rebuilt from an original pandas/university version to run on real cloud
-infrastructure — the point of the project was to learn what changes when you
-move a laptop pipeline onto AWS.
+Retail dataset (541,909 rows) and loads it into a star-schema warehouse in
+Postgres. Rebuilt from an original pandas/university version to run on real
+cloud infrastructure — the point of the project was to learn what changes when
+you move a laptop pipeline onto AWS.
 
 ## Architecture
 
 ```
-raw CSV
-   │ upload
-   ▼
-S3 raw/ ──event──▶ Lambda: clean ──▶ S3 processed/ ──event──┐
-                                                            ▼
-                        EventBridge (daily cron) ─────▶ Lambda: load ──▶ Postgres (Supabase)
+raw CSV ─▶ S3 raw/ ─event▶ Lambda: clean ─▶ S3 processed/ ─event▶ SQS ─▶ Lambda: load ─▶ Postgres star schema
+                                                                          ▲
+                                                EventBridge (daily) ──────┘
 ```
 
-The load Lambda has two triggers: a new Parquet in `processed/` (event-driven,
-loads fresh data) and a daily EventBridge schedule (refreshes from the latest
-processed file). It handles both event shapes.
+See [`docs/architecture.md`](docs/architecture.md) for the rendered diagram.
+The load Lambda has two triggers — the SQS queue (event-driven) and a daily
+EventBridge schedule — and handles both event shapes.
 
 ## Pipeline stages
 
@@ -38,24 +35,31 @@ CustomerID, removes negative quantities and prices, and drops cancelled orders
 
 Latest run: **541,909 in → 397,884 out; 144,025 rejected.**
 
-### 3. Load — Postgres
-`lambdas/load/lambda_function.py` reads the cleaned Parquet, aggregates the
-transactions to one row per customer (order count, item count, total spend,
-first/last purchase), and upserts the ~4,338 rows into a `customer_aggregates`
-table in Supabase. Writes are batched into multi-row inserts and use
-`ON CONFLICT` so re-runs are idempotent. Connects with pg8000 (bundled in the
-AWSSDKPandas layer) over the Supabase session pooler for IPv4 reachability from
-Lambda.
+### 3. Queue — SQS (decoupling)
+The Parquet write to `processed/` emits an event to an SQS queue rather than
+invoking the load Lambda directly. The queue decouples the two stages: it
+buffers events if the consumer is busy, retries a failed delivery, and (with a
+dead-letter queue attached) can isolate messages that keep failing. The load
+Lambda polls the queue.
+
+### 4. Load — star schema (Postgres)
+`lambdas/load/lambda_function.py` reads the cleaned Parquet, upserts the three
+dimensions (`dim_customer`, `dim_product`, `dim_date`), resolves each line's
+natural keys to surrogate keys, and bulk-loads ~397,884 rows into `fact_sales`
+with `COPY`. The fact table is truncate-and-reloaded, so re-runs are idempotent.
+`customer_aggregates` is exposed as a view over the star schema. Connects with
+pg8000 (bundled in the AWSSDKPandas layer) over the Supabase session pooler for
+IPv4 reachability from Lambda. See [`sql/schema.sql`](sql/schema.sql).
 
 Implementation note: the runtime's pandas returns nullable dtypes (`Int64`,
 `string`), and `pd.to_datetime` crashes on them here, so dates are kept as ISO
-strings and cast to `timestamp` server-side (`%s::timestamp`).
+strings and `date_key` is derived as `YYYYMMDD` without datetime parsing.
 
-### 4. Scheduling & monitoring
-A daily EventBridge rule invokes the load Lambda to refresh the aggregates,
-alongside the event-driven trigger. Each run logs `rows_read` / `customers_loaded`
-(load) and `rows_in` / `rows_out` / `rows_rejected` (clean) to CloudWatch, and
-the driver script surfaces the clean counts after a run.
+### 5. Scheduling & monitoring
+A daily EventBridge rule also invokes the load Lambda to refresh the warehouse
+from the latest processed file. Each run logs counts to CloudWatch — clean:
+`rows_in` / `rows_out` / `rows_rejected`; load: `facts_loaded` / `customers` /
+`products` / `dates` — and the driver script surfaces the clean counts after a run.
 
 ## Running it
 
@@ -79,23 +83,18 @@ AWS CLI configured with an IAM user that has S3 access.
   `processed/` is not updated. The driver polls for a *new* processed object
   (by timestamp), so this surfaces as a timeout rather than a false success.
 - **Load failure (DB connection or SQL error)** — the load Lambda raises and
-  logs the traceback to CloudWatch. The upsert commits once at the end, so a
-  mid-load failure leaves `customer_aggregates` unchanged (no partial writes),
-  and `ON CONFLICT` makes a retry safe.
+  logs the traceback. `TRUNCATE` + `COPY` run in one transaction, so a failure
+  rolls back to the previous load with no partial state. The SQS message becomes
+  visible again and is retried; a dead-letter queue can isolate poison messages.
 
 ## Cost
 
 Runs within AWS's always-free monthly limits — a few MB in S3 and a handful of
 Lambda invocations, well under the 1M free-request tier. The database is
-Supabase (free tier). Batching the load into multi-row inserts cut a
-cross-region write (Lambda in `ap-southeast-1`, Supabase pooler in
-`ap-northeast-1`) from ~5 min to ~2 s.
-
-## Planned (Day 3)
-
-Deferred, not yet built: a fact/dimension star schema (`sql/schema.sql`), an
-SQS queue decoupling the clean and load stages, and an architecture diagram
-under `docs/`.
+Supabase (free tier). The fact table is bulk-loaded with `COPY` (one streamed
+operation); most of a run's wall-clock time is building the rows in Python, not
+the database write. Note the cross-region hop: Lambda in `ap-southeast-1`,
+Supabase pooler in `ap-northeast-1`.
 
 ## Data
 
